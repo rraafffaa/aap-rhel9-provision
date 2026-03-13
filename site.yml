@@ -308,6 +308,12 @@
         policy: targeted
         state: enforcing
 
+    - name: Create containers config directory
+      ansible.builtin.file:
+        path: /root/.config/containers
+        state: directory
+        mode: "0700"
+
     - name: Configure container registry authentication
       ansible.builtin.copy:
         dest: /root/.config/containers/auth.json
