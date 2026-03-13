@@ -4,7 +4,7 @@
 # ============================================================================
 # Designed to run FROM an existing AAP on Azure controller.
 # Creates Azure infrastructure, provisions a RHEL 9 VM, and installs
-# AAP 2.5 (containerized) on it.
+# AAP 2.6 (containerized) on it.
 #
 # Prerequisites:
 #   - Azure credential configured in AAP (Service Principal or Managed Identity)
@@ -303,8 +303,8 @@
       until: pull_test is succeeded
 
 
-# ── PLAY 3: Download and Run AAP 2.5 Containerized Installer ──────────
-- name: "Phase 3 — Install AAP 2.5 (Containerized)"
+# ── PLAY 3: Download and Run AAP 2.6 Containerized Installer ──────────
+- name: "Phase 3 — Install AAP 2.6 (Containerized)"
   hosts: aap_nodes
   become: true
   gather_facts: true
@@ -314,7 +314,7 @@
 
   vars:
     aap_installer_dir: "/opt/aap-installer"
-    aap_bundle_name: "ansible-automation-platform-containerized-setup-bundle-{{ aap_version }}-1-x86_64.tar.gz"
+    aap_bundle_name: "ansible-automation-platform-containerized-setup-bundle-{{ aap_version }}-x86_64.tar.gz"
 
   tasks:
     - name: Create installer directory
@@ -340,7 +340,7 @@
     #     extra_opts: ["--strip-components=1"]
 
     # ── Option B: Install via RPM (simpler, requires RHSM repos) ──
-    - name: Enable AAP 2.5 repository
+    - name: Enable AAP 2.6 repository
       community.general.rhsm_repository:
         name: ansible-automation-platform-{{ aap_version }}-for-rhel-9-x86_64-rpms
         state: enabled
@@ -415,7 +415,7 @@
       ansible.builtin.debug:
         msg: |
           ══════════════════════════════════════════════════════
-          AAP 2.5 Installation Complete!
+          AAP 2.6 Installation Complete!
           ══════════════════════════════════════════════════════
           Controller URL:  https://{{ aap_public_ip }}
           Admin User:      {{ aap_admin_user }}
