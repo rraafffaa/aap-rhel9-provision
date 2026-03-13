@@ -226,12 +226,42 @@
         state: present
       register: rhsm_result
 
-    - name: Enable required RHEL 9 repositories
+    - name: List available RHSM repos (for debugging)
+      ansible.builtin.command: subscription-manager repos --list-enabled
+      register: enabled_repos
+      changed_when: false
+
+    - name: Show enabled repos
+      ansible.builtin.debug:
+        var: enabled_repos.stdout_lines
+
+    - name: Discover available RHEL base repo names
+      ansible.builtin.shell: |
+        subscription-manager repos --list | grep "Repo ID" | grep -i "rhel-9.*baseos" | awk '{print $3}' | head -1
+      register: baseos_repo
+      changed_when: false
+
+    - name: Discover available RHEL appstream repo names
+      ansible.builtin.shell: |
+        subscription-manager repos --list | grep "Repo ID" | grep -i "rhel-9.*appstream" | awk '{print $3}' | head -1
+      register: appstream_repo
+      changed_when: false
+
+    - name: Show discovered repo names
+      ansible.builtin.debug:
+        msg: "BaseOS: {{ baseos_repo.stdout | default('not found') }} | AppStream: {{ appstream_repo.stdout | default('not found') }}"
+
+    - name: Enable RHEL 9 BaseOS repository (if available via RHSM)
       community.general.rhsm_repository:
-        name:
-          - rhel-9-for-x86_64-baseos-rpms
-          - rhel-9-for-x86_64-appstream-rpms
+        name: "{{ baseos_repo.stdout }}"
         state: enabled
+      when: baseos_repo.stdout | length > 0
+
+    - name: Enable RHEL 9 AppStream repository (if available via RHSM)
+      community.general.rhsm_repository:
+        name: "{{ appstream_repo.stdout }}"
+        state: enabled
+      when: appstream_repo.stdout | length > 0
 
     - name: Update all packages to latest
       ansible.builtin.dnf:
