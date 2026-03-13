@@ -1,0 +1,73 @@
+---
+# ============================================================================
+# Teardown — Remove all Azure resources created by site.yml
+# ============================================================================
+- name: "Teardown AAP on RHEL 9 Azure Resources"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Confirm teardown
+      ansible.builtin.pause:
+        prompt: |
+          This will DELETE the following resources in {{ azure_resource_group }}:
+            - VM: {{ azure_vm_name }}
+            - NIC: {{ azure_nic_name }}
+            - Public IP: {{ azure_public_ip_name }}
+            - NSG: {{ azure_nsg_name }}
+            - Subnet: {{ azure_subnet_name }}
+            - VNet: {{ azure_vnet_name }}
+          Press Enter to continue or Ctrl+C to abort.
+      when: confirm_teardown | default(true) | bool
+
+    - name: Delete virtual machine
+      azure.azcollection.azure_rm_virtualmachine:
+        resource_group: "{{ azure_resource_group }}"
+        name: "{{ azure_vm_name }}"
+        remove_on_absent:
+          - all_autocreated
+        state: absent
+
+    - name: Delete network interface
+      azure.azcollection.azure_rm_networkinterface:
+        resource_group: "{{ azure_resource_group }}"
+        name: "{{ azure_nic_name }}"
+        state: absent
+
+    - name: Delete public IP
+      azure.azcollection.azure_rm_publicipaddress:
+        resource_group: "{{ azure_resource_group }}"
+        name: "{{ azure_public_ip_name }}"
+        state: absent
+
+    - name: Delete network security group
+      azure.azcollection.azure_rm_securitygroup:
+        resource_group: "{{ azure_resource_group }}"
+        name: "{{ azure_nsg_name }}"
+        state: absent
+
+    - name: Delete subnet
+      azure.azcollection.azure_rm_subnet:
+        resource_group: "{{ azure_resource_group }}"
+        virtual_network_name: "{{ azure_vnet_name }}"
+        name: "{{ azure_subnet_name }}"
+        state: absent
+
+    - name: Delete virtual network
+      azure.azcollection.azure_rm_virtualnetwork:
+        resource_group: "{{ azure_resource_group }}"
+        name: "{{ azure_vnet_name }}"
+        state: absent
+
+    - name: Clean up local SSH key
+      ansible.builtin.file:
+        path: "/tmp/{{ azure_vm_name }}_id_rsa{{ item }}"
+        state: absent
+      loop:
+        - ""
+        - ".pub"
+
+    - name: Teardown complete
+      ansible.builtin.debug:
+        msg: "All AAP Azure resources have been removed from {{ azure_resource_group }}."

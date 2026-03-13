@@ -1,0 +1,458 @@
+---
+# ============================================================================
+# AAP on RHEL 9 — Full Provisioning Playbook
+# ============================================================================
+# Designed to run FROM an existing AAP on Azure controller.
+# Creates Azure infrastructure, provisions a RHEL 9 VM, and installs
+# AAP 2.5 (containerized) on it.
+#
+# Prerequisites:
+#   - Azure credential configured in AAP (Service Principal or Managed Identity)
+#   - azure.azcollection collection installed on execution environment
+#   - RHSM credentials for RHEL subscription and registry.redhat.io access
+#   - AAP admin password provided via survey/vault
+#
+# Usage from AAP Controller:
+#   1. Create a Project pointing to this repo
+#   2. Create a Job Template using site.yml
+#   3. Attach Azure credential + Machine credential (for SSH key)
+#   4. Add a Survey for: aap_admin_password, rhsm_username, rhsm_password
+#   5. Launch!
+# ============================================================================
+
+# ── PLAY 1: Provision Azure Infrastructure ─────────────────────────────
+- name: "Phase 1 — Provision Azure Infrastructure"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags:
+    - infra
+    - azure
+
+  tasks:
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - azure_resource_group is defined
+          - azure_location is defined
+          - azure_vm_name is defined
+          - aap_admin_password is defined
+          - rhsm_username is defined
+          - rhsm_password is defined
+        fail_msg: >
+          Missing required variables. Ensure aap_admin_password, rhsm_username,
+          and rhsm_password are provided via survey or extra vars.
+
+    - name: Create virtual network
+      azure.azcollection.azure_rm_virtualnetwork:
+        resource_group: "{{ azure_resource_group }}"
+        name: "{{ azure_vnet_name }}"
+        address_prefixes_cidr:
+          - "{{ azure_vnet_cidr }}"
+        location: "{{ azure_location }}"
+        state: present
+      register: vnet_result
+
+    - name: Create subnet
+      azure.azcollection.azure_rm_subnet:
+        resource_group: "{{ azure_resource_group }}"
+        virtual_network_name: "{{ azure_vnet_name }}"
+        name: "{{ azure_subnet_name }}"
+        address_prefix_cidr: "{{ azure_subnet_cidr }}"
+        state: present
+      register: subnet_result
+
+    - name: Create network security group
+      azure.azcollection.azure_rm_securitygroup:
+        resource_group: "{{ azure_resource_group }}"
+        name: "{{ azure_nsg_name }}"
+        location: "{{ azure_location }}"
+        rules:
+          - name: AllowSSH
+            protocol: Tcp
+            destination_port_range: 22
+            access: Allow
+            priority: 1000
+            direction: Inbound
+            description: "Allow SSH access"
+
+          - name: AllowHTTPS
+            protocol: Tcp
+            destination_port_range: 443
+            access: Allow
+            priority: 1010
+            direction: Inbound
+            description: "Allow HTTPS for AAP web UI"
+
+          - name: AllowHTTP
+            protocol: Tcp
+            destination_port_range: 80
+            access: Allow
+            priority: 1020
+            direction: Inbound
+            description: "Allow HTTP (redirect to HTTPS)"
+
+          - name: AllowAAP_Receptor
+            protocol: Tcp
+            destination_port_range: 27199
+            access: Allow
+            priority: 1030
+            direction: Inbound
+            description: "Allow Receptor mesh connections"
+        state: present
+
+    - name: Create public IP address
+      azure.azcollection.azure_rm_publicipaddress:
+        resource_group: "{{ azure_resource_group }}"
+        name: "{{ azure_public_ip_name }}"
+        location: "{{ azure_location }}"
+        allocation_method: Static
+        sku: Standard
+        state: present
+      register: pip_result
+
+    - name: Create network interface
+      azure.azcollection.azure_rm_networkinterface:
+        resource_group: "{{ azure_resource_group }}"
+        name: "{{ azure_nic_name }}"
+        location: "{{ azure_location }}"
+        virtual_network: "{{ azure_vnet_name }}"
+        subnet_name: "{{ azure_subnet_name }}"
+        security_group: "{{ azure_nsg_name }}"
+        ip_configurations:
+          - name: default
+            public_ip_address_name: "{{ azure_public_ip_name }}"
+            primary: true
+        state: present
+      register: nic_result
+
+    - name: Generate SSH key pair for VM access
+      community.crypto.openssh_keypair:
+        path: "/tmp/{{ azure_vm_name }}_id_rsa"
+        type: rsa
+        size: 4096
+        state: present
+      register: ssh_key
+
+    - name: Create RHEL 9 virtual machine
+      azure.azcollection.azure_rm_virtualmachine:
+        resource_group: "{{ azure_resource_group }}"
+        name: "{{ azure_vm_name }}"
+        location: "{{ azure_location }}"
+        vm_size: "{{ azure_vm_size }}"
+        admin_username: "{{ azure_vm_admin_user }}"
+        ssh_password_enabled: false
+        ssh_public_keys:
+          - path: "/home/{{ azure_vm_admin_user }}/.ssh/authorized_keys"
+            key_data: "{{ ssh_key.public_key }}"
+        network_interfaces:
+          - "{{ azure_nic_name }}"
+        image: "{{ azure_vm_image }}"
+        os_disk_size_gb: "{{ azure_vm_os_disk_size_gb }}"
+        managed_disk_type: Premium_LRS
+        os_type: Linux
+        tags:
+          environment: lab
+          purpose: aap-controller
+          provisioned_by: aap-on-azure
+        state: present
+      register: vm_result
+
+    - name: Get VM public IP details
+      azure.azcollection.azure_rm_publicipaddress_info:
+        resource_group: "{{ azure_resource_group }}"
+        name: "{{ azure_public_ip_name }}"
+      register: pip_info
+
+    - name: Set connection facts
+      ansible.builtin.set_fact:
+        aap_public_ip: "{{ pip_info.publicipaddresses[0].ip_address }}"
+        aap_private_ip: "{{ vm_result.ansible_facts.azure_vm.properties.networkProfile.networkInterfaces[0].properties.ipConfigurations[0].properties.privateIPAddress | default(nic_result.state.ip_configuration.private_ip_address) }}"
+        aap_ssh_key_path: "/tmp/{{ azure_vm_name }}_id_rsa"
+
+    - name: Display VM connection info
+      ansible.builtin.debug:
+        msg: |
+          ══════════════════════════════════════════════
+          Azure VM Provisioned Successfully
+          ══════════════════════════════════════════════
+          VM Name:     {{ azure_vm_name }}
+          Public IP:   {{ aap_public_ip }}
+          Private IP:  {{ aap_private_ip }}
+          SSH User:    {{ azure_vm_admin_user }}
+          SSH Key:     {{ aap_ssh_key_path }}
+          ══════════════════════════════════════════════
+
+    - name: Add new VM to in-memory inventory
+      ansible.builtin.add_host:
+        name: "{{ azure_vm_name }}"
+        ansible_host: "{{ aap_public_ip }}"
+        ansible_user: "{{ azure_vm_admin_user }}"
+        ansible_ssh_private_key_file: "{{ aap_ssh_key_path }}"
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        groups:
+          - aap_nodes
+        aap_private_ip: "{{ aap_private_ip }}"
+        aap_public_ip: "{{ aap_public_ip }}"
+
+    - name: Wait for SSH to become available
+      ansible.builtin.wait_for:
+        host: "{{ aap_public_ip }}"
+        port: 22
+        delay: 30
+        timeout: 600
+        state: started
+
+
+# ── PLAY 2: Configure RHEL 9 and Install Prerequisites ────────────────
+- name: "Phase 2 — Configure RHEL 9 Host"
+  hosts: aap_nodes
+  become: true
+  gather_facts: true
+  tags:
+    - configure
+    - rhel
+
+  tasks:
+    - name: Display target host info
+      ansible.builtin.debug:
+        msg: "Configuring {{ inventory_hostname }} ({{ ansible_host }}) — {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+    - name: Register system with Red Hat Subscription Manager
+      community.general.redhat_subscription:
+        username: "{{ rhsm_username }}"
+        password: "{{ rhsm_password }}"
+        auto_attach: true
+        state: present
+      register: rhsm_result
+
+    - name: Enable required RHEL 9 repositories
+      community.general.rhsm_repository:
+        name:
+          - rhel-9-for-x86_64-baseos-rpms
+          - rhel-9-for-x86_64-appstream-rpms
+        state: enabled
+
+    - name: Update all packages to latest
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+        update_cache: true
+      register: update_result
+
+    - name: Install prerequisite packages
+      ansible.builtin.dnf:
+        name:
+          - podman
+          - ansible-core
+          - python3-pip
+          - git
+          - wget
+          - curl
+          - tar
+          - unzip
+          - openssl
+          - firewalld
+        state: present
+
+    - name: Start and enable firewalld
+      ansible.builtin.systemd:
+        name: firewalld
+        state: started
+        enabled: true
+
+    - name: Open firewall ports for AAP
+      ansible.posix.firewalld:
+        port: "{{ item }}"
+        permanent: true
+        immediate: true
+        state: enabled
+      loop:
+        - 443/tcp
+        - 80/tcp
+        - 27199/tcp
+        - 5432/tcp
+
+    - name: Set SELinux to enforcing
+      ansible.posix.selinux:
+        policy: targeted
+        state: enforcing
+
+    - name: Configure container registry authentication
+      ansible.builtin.copy:
+        dest: /root/.config/containers/auth.json
+        mode: "0600"
+        content: |
+          {
+            "auths": {
+              "registry.redhat.io": {
+                "auth": "{{ (rhsm_username + ':' + rhsm_password) | b64encode }}"
+              }
+            }
+          }
+      no_log: true
+
+    - name: Verify podman can pull from registry.redhat.io
+      containers.podman.podman_image:
+        name: registry.redhat.io/ubi9/ubi-minimal
+        tag: latest
+        state: present
+      register: pull_test
+      retries: 3
+      delay: 10
+      until: pull_test is succeeded
+
+
+# ── PLAY 3: Download and Run AAP 2.5 Containerized Installer ──────────
+- name: "Phase 3 — Install AAP 2.5 (Containerized)"
+  hosts: aap_nodes
+  become: true
+  gather_facts: true
+  tags:
+    - install
+    - aap
+
+  vars:
+    aap_installer_dir: "/opt/aap-installer"
+    aap_bundle_name: "ansible-automation-platform-containerized-setup-bundle-{{ aap_version }}-1-x86_64.tar.gz"
+
+  tasks:
+    - name: Create installer directory
+      ansible.builtin.file:
+        path: "{{ aap_installer_dir }}"
+        state: directory
+        mode: "0755"
+
+    # ── Option A: Download installer bundle from access.redhat.com ──
+    # If you have the bundle URL or have pre-staged the tarball:
+    #
+    # - name: Download AAP installer bundle
+    #   ansible.builtin.get_url:
+    #     url: "{{ aap_bundle_url }}"
+    #     dest: "/tmp/{{ aap_bundle_name }}"
+    #     mode: "0644"
+    #
+    # - name: Extract installer bundle
+    #   ansible.builtin.unarchive:
+    #     src: "/tmp/{{ aap_bundle_name }}"
+    #     dest: "{{ aap_installer_dir }}"
+    #     remote_src: true
+    #     extra_opts: ["--strip-components=1"]
+
+    # ── Option B: Install via RPM (simpler, requires RHSM repos) ──
+    - name: Enable AAP 2.5 repository
+      community.general.rhsm_repository:
+        name: ansible-automation-platform-{{ aap_version }}-for-rhel-9-x86_64-rpms
+        state: enabled
+
+    - name: Install AAP containerized setup RPM
+      ansible.builtin.dnf:
+        name: ansible-automation-platform-containerized-setup
+        state: present
+      register: aap_rpm_install
+
+    - name: Locate the installed setup directory
+      ansible.builtin.find:
+        paths: /opt
+        patterns: "ansible-automation-platform-containerized-setup*"
+        file_type: directory
+        recurse: false
+      register: setup_dirs
+
+    - name: Set installer path from RPM install
+      ansible.builtin.set_fact:
+        aap_installer_dir: "{{ setup_dirs.files[0].path | default('/opt/ansible-automation-platform-containerized-setup') }}"
+      when: setup_dirs.files | length > 0
+
+    - name: Generate AAP installer inventory
+      ansible.builtin.template:
+        src: templates/aap_inventory.j2
+        dest: "{{ aap_installer_dir }}/inventory"
+        mode: "0600"
+
+    - name: Display installer inventory for verification
+      ansible.builtin.command:
+        cmd: "cat {{ aap_installer_dir }}/inventory"
+      register: inventory_content
+      changed_when: false
+
+    - name: Show inventory content
+      ansible.builtin.debug:
+        var: inventory_content.stdout_lines
+
+    - name: Run AAP containerized installer
+      ansible.builtin.command:
+        cmd: >
+          ansible-playbook -i inventory ansible.containerized_installer.install
+        chdir: "{{ aap_installer_dir }}"
+      environment:
+        ANSIBLE_CALLBACKS_ENABLED: "profile_tasks"
+      register: installer_result
+      async: 3600
+      poll: 30
+
+    - name: Display installer result
+      ansible.builtin.debug:
+        msg: |
+          ══════════════════════════════════════════════
+          AAP Installation {{ 'SUCCEEDED' if installer_result.rc == 0 else 'FAILED' }}
+          ══════════════════════════════════════════════
+          Return code: {{ installer_result.rc }}
+          ══════════════════════════════════════════════
+
+    - name: Wait for AAP controller to be responsive
+      ansible.builtin.uri:
+        url: "https://{{ aap_public_ip }}/api/v2/ping/"
+        validate_certs: false
+        status_code: 200
+      register: aap_ping
+      retries: 30
+      delay: 20
+      until: aap_ping.status == 200
+      when: installer_result.rc == 0
+
+    - name: Display AAP access information
+      ansible.builtin.debug:
+        msg: |
+          ══════════════════════════════════════════════════════
+          AAP 2.5 Installation Complete!
+          ══════════════════════════════════════════════════════
+          Controller URL:  https://{{ aap_public_ip }}
+          Admin User:      {{ aap_admin_user }}
+          SSH Access:      ssh {{ azure_vm_admin_user }}@{{ aap_public_ip }}
+          ──────────────────────────────────────────────────────
+          VM Name:         {{ azure_vm_name }}
+          VM Size:         {{ azure_vm_size }}
+          Resource Group:  {{ azure_resource_group }}
+          Location:        {{ azure_location }}
+          ══════════════════════════════════════════════════════
+      when: installer_result.rc == 0
+
+
+# ── PLAY 4: Post-Install Verification ─────────────────────────────────
+- name: "Phase 4 — Verify Installation"
+  hosts: aap_nodes
+  become: true
+  gather_facts: false
+  tags:
+    - verify
+
+  tasks:
+    - name: Check running AAP containers
+      containers.podman.podman_container_info: {}
+      register: container_info
+
+    - name: Display running containers
+      ansible.builtin.debug:
+        msg: "Running containers: {{ container_info.containers | map(attribute='Name') | list }}"
+
+    - name: Verify controller API endpoint
+      ansible.builtin.uri:
+        url: "https://localhost/api/v2/ping/"
+        validate_certs: false
+        status_code: 200
+      register: api_check
+
+    - name: Show API ping response
+      ansible.builtin.debug:
+        var: api_check.json
