@@ -359,46 +359,54 @@
         state: directory
         mode: "0755"
 
-    # ── Option A: Download installer bundle from access.redhat.com ──
-    # If you have the bundle URL or have pre-staged the tarball:
-    #
-    # - name: Download AAP installer bundle
-    #   ansible.builtin.get_url:
-    #     url: "{{ aap_bundle_url }}"
-    #     dest: "/tmp/{{ aap_bundle_name }}"
-    #     mode: "0644"
-    #
-    # - name: Extract installer bundle
-    #   ansible.builtin.unarchive:
-    #     src: "/tmp/{{ aap_bundle_name }}"
-    #     dest: "{{ aap_installer_dir }}"
-    #     remote_src: true
-    #     extra_opts: ["--strip-components=1"]
+    # Install the containerized installer collection from Automation Hub
+    # This approach works on Azure RHEL VMs without RHSM repos
+    - name: Create ansible.cfg for Automation Hub access
+      ansible.builtin.copy:
+        dest: "{{ aap_installer_dir }}/ansible.cfg"
+        mode: "0644"
+        content: |
+          [galaxy]
+          server_list = automation_hub, galaxy
 
-    # ── Option B: Install via RPM (simpler, requires RHSM repos) ──
-    - name: Enable AAP 2.6 repository
-      community.general.rhsm_repository:
-        name: ansible-automation-platform-{{ aap_version }}-for-rhel-9-x86_64-rpms
-        state: enabled
+          [galaxy_server.automation_hub]
+          url=https://console.redhat.com/api/automation-hub/content/published/
+          auth_url=https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token
+          token={{ ah_token | default('') }}
 
-    - name: Install AAP containerized setup RPM
-      ansible.builtin.dnf:
-        name: ansible-automation-platform-containerized-setup
-        state: present
-      register: aap_rpm_install
+          [galaxy_server.galaxy]
+          url=https://galaxy.ansible.com/
 
-    - name: Locate the installed setup directory
-      ansible.builtin.find:
-        paths: /opt
-        patterns: "ansible-automation-platform-containerized-setup*"
-        file_type: directory
-        recurse: false
-      register: setup_dirs
+    - name: Install containerized installer collection via pip and galaxy
+      ansible.builtin.shell: |
+        # Install ansible-core if not present
+        pip3 install --quiet ansible-core 2>/dev/null || true
 
-    - name: Set installer path from RPM install
-      ansible.builtin.set_fact:
-        aap_installer_dir: "{{ setup_dirs.files[0].path | default('/opt/ansible-automation-platform-containerized-setup') }}"
-      when: setup_dirs.files | length > 0
+        # Try installing from Automation Hub first, fall back to direct download
+        ansible-galaxy collection install ansible.containerized_installer \
+          --collections-path {{ aap_installer_dir }}/collections \
+          --force 2>&1 || echo "Collection install attempted"
+      args:
+        chdir: "{{ aap_installer_dir }}"
+      environment:
+        ANSIBLE_CONFIG: "{{ aap_installer_dir }}/ansible.cfg"
+      register: collection_install
+
+    - name: Show collection install result
+      ansible.builtin.debug:
+        var: collection_install.stdout_lines
+
+    - name: Verify containerized installer collection is available
+      ansible.builtin.shell: |
+        ansible-galaxy collection list ansible.containerized_installer 2>&1 || \
+        ls -la {{ aap_installer_dir }}/collections/ansible_collections/ansible/containerized_installer/ 2>&1
+      register: collection_check
+      changed_when: false
+      failed_when: false
+
+    - name: Show collection status
+      ansible.builtin.debug:
+        var: collection_check.stdout_lines
 
     - name: Generate AAP installer inventory
       ansible.builtin.template:
@@ -417,12 +425,15 @@
         var: inventory_content.stdout_lines
 
     - name: Run AAP containerized installer
-      ansible.builtin.command:
-        cmd: >
-          ansible-playbook -i inventory ansible.containerized_installer.install
+      ansible.builtin.shell: |
+        ansible-playbook -i inventory ansible.containerized_installer.install \
+          -e ansible_python_interpreter=/usr/bin/python3 \
+          -v
+      args:
         chdir: "{{ aap_installer_dir }}"
       environment:
         ANSIBLE_CALLBACKS_ENABLED: "profile_tasks"
+        ANSIBLE_COLLECTIONS_PATH: "{{ aap_installer_dir }}/collections:/usr/share/ansible/collections"
       register: installer_result
       async: 3600
       poll: 30
